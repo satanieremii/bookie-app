@@ -46,17 +46,40 @@ private enum ReaderTheme: String, Codable, CaseIterable {
     }
 }
 
+private struct ScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ScrollContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct ChapterOffsetKey: PreferenceKey {
+    static var defaultValue: [Int: CGFloat] = [:]
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
 private struct ReaderChapter: Codable, Hashable, Identifiable {
     let id: UUID
     var title: String
     var content: String
     var locationHint: String
+    var pageIndex: Int?
 
-    init(title: String, content: String, locationHint: String) {
+    init(title: String, content: String, locationHint: String, pageIndex: Int? = nil) {
         self.id = UUID()
         self.title = title
         self.content = content
         self.locationHint = locationHint
+        self.pageIndex = pageIndex
     }
 }
 
@@ -93,6 +116,18 @@ private struct BookItem: Identifiable, Codable, Hashable {
     var isFinished: Bool
 
     var progressPercent: Int { Int((progress * 100).rounded()) }
+
+    func chapterIndex(containingPage pageIndex: Int) -> Int {
+        let indexed = chapters.enumerated().compactMap { index, chapter -> (Int, Int)? in
+            guard let chapterPage = chapter.pageIndex else { return nil }
+            return (index, chapterPage)
+        }
+        guard !indexed.isEmpty else {
+            return min(max(pageIndex, 0), max(chapters.count - 1, 0))
+        }
+
+        return indexed.last(where: { $0.1 <= pageIndex })?.0 ?? indexed[0].0
+    }
 }
 
 private struct Playlist: Identifiable, Codable, Hashable {
@@ -143,14 +178,14 @@ private final class LibraryStore: ObservableObject {
            let snapshot = try? JSONDecoder().decode(LibrarySnapshot.self, from: data) {
             books = snapshot.books
             playlists = snapshot.playlists
+            if refreshStoredBookStructures() {
+                persist()
+            }
             return
         }
 
         playlists = [
             Playlist(id: UUID(), name: "Tomarry", emoji: "🐍"),
-            Playlist(id: UUID(), name: "Dramione", emoji: "❤️‍🩹"),
-            Playlist(id: UUID(), name: "Severitus", emoji: "🐤"),
-            Playlist(id: UUID(), name: "Dark Harry/Grey Harry", emoji: "⚡️")
         ]
         persist()
     }
@@ -159,6 +194,73 @@ private final class LibraryStore: ObservableObject {
         let snapshot = LibrarySnapshot(books: books, playlists: playlists)
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         try? data.write(to: LibraryDiskStore.metadataURL, options: [.atomic])
+    }
+
+    private func refreshStoredBookStructures() -> Bool {
+        var didChange = false
+
+        for index in books.indices {
+            let fileURL = LibraryDiskStore.booksDirectory.appendingPathComponent(books[index].fileName)
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
+
+            var refreshedChapters: [ReaderChapter] = []
+            var refreshedTextChunks = books[index].textChunks
+            var refreshedPageCount = books[index].pageCount
+
+            switch books[index].format {
+            case .pdf:
+                if let doc = PDFDocument(url: fileURL) {
+                    refreshedPageCount = doc.pageCount
+                    refreshedChapters = makePDFChapters(from: doc)
+                }
+            case .txt:
+                if let raw = try? String(contentsOf: fileURL, encoding: .utf8) {
+                    refreshedTextChunks = raw
+                        .components(separatedBy: "\n\n")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    if refreshedTextChunks.isEmpty {
+                        refreshedTextChunks = ["This text file appears to be empty or unsupported encoding."]
+                    }
+                    refreshedChapters = makeTextChapters(from: refreshedTextChunks)
+                }
+            case .epub:
+                if let epub = try? EPUBParser.parse(fileURL: fileURL) {
+                    refreshedChapters = epub.chapters
+                }
+            }
+
+            guard !refreshedChapters.isEmpty else { continue }
+
+            if !chaptersMatch(books[index].chapters, refreshedChapters) {
+                let oldChapter = books[index].currentChapter
+                books[index].chapters = refreshedChapters
+                books[index].currentChapter = min(oldChapter, max(refreshedChapters.count - 1, 0))
+                didChange = true
+            }
+
+            if books[index].textChunks != refreshedTextChunks {
+                books[index].textChunks = refreshedTextChunks
+                didChange = true
+            }
+
+            if books[index].pageCount != refreshedPageCount {
+                books[index].pageCount = refreshedPageCount
+                didChange = true
+            }
+        }
+
+        return didChange
+    }
+
+    private func chaptersMatch(_ lhs: [ReaderChapter], _ rhs: [ReaderChapter]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { left, right in
+            left.title == right.title &&
+            left.locationHint == right.locationHint &&
+            left.pageIndex == right.pageIndex &&
+            left.content.count == right.content.count
+        }
     }
 
     func addPlaylist(name: String, emoji: String) {
@@ -269,24 +371,113 @@ private final class LibraryStore: ObservableObject {
 
     private func makePDFChapters(from doc: PDFDocument) -> [ReaderChapter] {
         guard doc.pageCount > 0 else { return [] }
+        let outlineChapters = makePDFOutlineChapters(from: doc)
+        if !outlineChapters.isEmpty { return outlineChapters }
+
         return (0..<doc.pageCount).map { index in
             let text = doc.page(at: index)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return ReaderChapter(
                 title: "Page \(index + 1)",
                 content: text,
-                locationHint: "p.\(index + 1)"
+                locationHint: "p.\(index + 1)",
+                pageIndex: index
             )
         }
     }
 
+    private func makePDFOutlineChapters(from doc: PDFDocument) -> [ReaderChapter] {
+        guard let outline = doc.outlineRoot else { return [] }
+        var chapters: [ReaderChapter] = []
+
+        func walk(_ node: PDFOutline, level: Int) {
+            for index in 0..<node.numberOfChildren {
+                guard let child = node.child(at: index) else { continue }
+                var destination = child.destination
+                if destination == nil, let action = child.action as? PDFActionGoTo {
+                    destination = action.destination
+                }
+                let page = destination?.page
+                let pageIndex = page.map { doc.index(for: $0) }.flatMap { $0 >= 0 ? $0 : nil }
+
+                if let pageIndex {
+                    let pageText = doc.page(at: pageIndex)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let title = (child.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    chapters.append(
+                        ReaderChapter(
+                            title: title.isEmpty ? "Chapter \(chapters.count + 1)" : title,
+                            content: pageText,
+                            locationHint: "p.\(pageIndex + 1)",
+                            pageIndex: pageIndex
+                        )
+                    )
+                }
+
+                walk(child, level: level + 1)
+            }
+        }
+
+        walk(outline, level: 0)
+        return chapters.sorted { ($0.pageIndex ?? 0) < ($1.pageIndex ?? 0) }
+    }
+
     private func makeTextChapters(from chunks: [String]) -> [ReaderChapter] {
-        guard !chunks.isEmpty else { return [] }
-        return chunks.enumerated().map { index, chunk in
-            ReaderChapter(
-                title: "Chapter \(index + 1)",
-                content: chunk,
-                locationHint: "\(index + 1)"
+        let fullText = chunks.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !fullText.isEmpty else { return [] }
+
+        let lines = fullText.components(separatedBy: .newlines)
+        var chapters: [ReaderChapter] = []
+        var currentTitle = "Chapter 1"
+        var currentLines: [String] = []
+
+        func flush() {
+            let content = currentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !content.isEmpty else { return }
+            chapters.append(
+                ReaderChapter(
+                    title: currentTitle,
+                    content: content,
+                    locationHint: "\(chapters.count + 1)"
+                )
             )
+        }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isTextChapterHeading(trimmed), !currentLines.isEmpty {
+                flush()
+                currentTitle = trimmed
+                currentLines = [line]
+            } else {
+                if currentLines.isEmpty, isTextChapterHeading(trimmed) {
+                    currentTitle = trimmed
+                }
+                currentLines.append(line)
+            }
+        }
+
+        flush()
+
+        if chapters.count > 1 { return chapters }
+        return [
+            ReaderChapter(
+                title: chapters.first?.title ?? "Text",
+                content: fullText,
+                locationHint: "1"
+            )
+        ]
+    }
+
+    private func isTextChapterHeading(_ line: String) -> Bool {
+        guard !line.isEmpty, line.count <= 90 else { return false }
+        let patterns = [
+            #"^(chapter|part|book|section)\s+([0-9ivxlcdm]+|[a-z]+)\b.*"#,
+            #"^(глава|часть|раздел)\s+([0-9ivxlcdm]+|[а-яё]+)\b.*"#,
+            #"^[0-9]+[\.\)]\s+\S.*"#,
+            #"^[ivxlcdm]+[\.\)]\s+\S.*"#
+        ]
+
+        return patterns.contains { pattern in
+            line.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
         }
     }
 
@@ -355,37 +546,32 @@ private struct HeaderView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            LinearGradient(
-                colors: [Color(red: 125 / 255, green: 57 / 255, blue: 105 / 255), Color(red: 206 / 255, green: 123 / 255, blue: 167 / 255)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .frame(height: 135)
-            .overlay(alignment: .topLeading) {
-                Text("9:41")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.leading, 28)
-                    .padding(.top, 20)
-            }
+            Image("HeaderImage")
+                .resizable()
+                .scaledToFill()
+                .frame(height: 160)
+                .frame(maxWidth: .infinity)
+                .clipped()
 
             HStack {
                 Text("hi, julls!⭐️")
-                    .font(.cochin(size: 24))
+                    .font(.cochin(size: 42))
+                    .fontWeight(.bold)
                     .minimumScaleFactor(0.7)
                 Spacer()
                 Button { showingAddBook = true } label: {
                     Circle()
-                        .fill(Color(red: 243 / 255, green: 219 / 255, blue: 233 / 255))
-                        .frame(width: 46, height: 46)
+                        .fill(Color(red: 243/255, green: 219/255, blue: 233/255))
+                        .frame(width: 40, height: 40)
                         .overlay {
                             Image(systemName: "icloud.and.arrow.up")
-                                .foregroundStyle(Color(red: 227 / 255, green: 105 / 255, blue: 180 / 255))
+                                .font(.system(size: 16))
+                                .foregroundStyle(Color(red: 227/255, green: 105/255, blue: 180/255))
                         }
                 }
             }
-            .padding(.horizontal, 30)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
         }
     }
 }
@@ -401,7 +587,7 @@ private struct ActiveTabView: View {
         case .library:
             LibraryScreen(readerBookID: $readerBookID)
         case .playlists:
-            PlaylistScreen()
+            PlaylistScreen(readerBookID: $readerBookID)
         }
     }
 }
@@ -409,50 +595,219 @@ private struct ActiveTabView: View {
 private struct HomeScreen: View {
     @EnvironmentObject private var store: LibraryStore
     @Binding var readerBookID: UUID?
+    @State private var openedMenuBookID: UUID?
+    @State private var openedMenuOnRight = false
+    @State private var shareItems: [Any] = []
+    @State private var showShareSheet = false
+    @State private var playlistPickerBookID: UUID?
+    @State private var showPlaylistPicker = false
+    @State private var tagEditorBookID: UUID?
+    @State private var newTagText = ""
+    @State private var renameBookID: UUID?
+    @State private var renameText = ""
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 8) {
-                    Circle().stroke(Color.pink, lineWidth: 2).frame(width: 14, height: 14)
-                    Text("Daily Reading ➡ 5 minutes left")
-                        .font(.workSans(size: 13))
+            VStack(alignment: .leading, spacing: 0) {
+                // Daily Reading pill
+                HStack(spacing: 6) {
+                    Circle()
+                        .stroke(Color.pink, lineWidth: 1.5)
+                        .frame(width: 12, height: 12)
+                    Text("Daily Reading  ➡  5 minutes left")
+                        .font(.workSans(size: 12))
                         .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 30)
-                .padding(.top, 12)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.6))
+                )
+                .padding(.horizontal, 20)
+                .padding(.top, 14)
 
+                // Current / Recent заголовки
                 HStack {
-                    Text("Current").font(.cochin(size: 28))
+                    Text("Current").font(.cochin(size: 26))
                     Spacer()
-                    Text("Recent").font(.cochin(size: 28))
-                    Spacer().frame(width: 16)
+                    Text("Recent").font(.cochin(size: 26))
+                    Spacer().frame(width: 20)
                 }
-                .padding(.horizontal, 30)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
 
+                // Горизонтальный скролл книг
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 16) {
-                        ForEach(store.books.prefix(5)) { book in
-                            BookCard(book: book)
-                                .onTapGesture { readerBookID = book.id }
+                    HStack(spacing: 12) {
+                        ForEach(Array(store.books.prefix(5).enumerated()), id: \.element.id) { index, book in
+                            VStack(alignment: .leading, spacing: 8) {
+                                BookCard(book: book)
+                                    .onTapGesture { readerBookID = book.id }
+                                Text(book.title)
+                                    .font(.workSans(size: 13, bold: true))
+                                    .lineLimit(1)
+                                    .frame(width: 146)
+                                HStack {
+                                    Text("\(book.progressPercent)%")
+                                        .font(.workSans(size: 11))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button {
+                                        openedMenuBookID = (openedMenuBookID == book.id) ? nil : book.id
+                                        openedMenuOnRight = index % 2 == 1
+                                    } label: {
+                                        Image(systemName: "ellipsis")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .frame(width: 146)
+
+                                if openedMenuBookID == book.id {
+                                    BookContextPopup(onRightSide: openedMenuOnRight) { action in
+                                        switch action {
+                                        case .share:
+                                            shareItems = [book.title, "by \(book.author)"]
+                                            showShareSheet = true
+                                        case .addToPlaylist:
+                                            playlistPickerBookID = book.id
+                                            showPlaylistPicker = true
+                                        case .toggleFinished:
+                                            store.updateBook(book.id) { item in
+                                                item.isFinished.toggle()
+                                                if item.isFinished { item.progress = 1 }
+                                            }
+                                        case .addTag:
+                                            tagEditorBookID = book.id
+                                        case .rename:
+                                            renameBookID = book.id
+                                            renameText = book.title
+                                        case .delete:
+                                            store.deleteBook(book.id)
+                                        }
+                                        openedMenuBookID = nil
+                                    }
+                                }
+                            }
                         }
                     }
-                    .padding(.horizontal, 30)
+                    .padding(.horizontal, 20)
                 }
-                Spacer(minLength: 100)
+
+                Spacer(minLength: 120)
             }
         }
+        .sheet(isPresented: $showShareSheet) {
+            ShareSheet(items: shareItems)
+        }
+        .sheet(isPresented: $showPlaylistPicker) {
+            if let bookID = playlistPickerBookID {
+                PlaylistPickerSheet(bookID: bookID)
+                    .environmentObject(store)
+            }
+        }
+        .alert("Add tag", isPresented: Binding(
+            get: { tagEditorBookID != nil },
+            set: { if !$0 { tagEditorBookID = nil; newTagText = "" } }
+        )) {
+            TextField("Tag name", text: $newTagText)
+            Button("Cancel", role: .cancel) {
+                tagEditorBookID = nil
+                newTagText = ""
+            }
+            Button("Add") {
+                if let id = tagEditorBookID {
+                    let tag = newTagText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !tag.isEmpty {
+                        store.updateBook(id) { item in
+                            if !item.tags.contains(tag) { item.tags.append(tag) }
+                        }
+                    }
+                }
+                tagEditorBookID = nil
+                newTagText = ""
+            }
+        }
+        .alert("Change name", isPresented: Binding(
+            get: { renameBookID != nil },
+            set: { if !$0 { renameBookID = nil } }
+        )) {
+            TextField("Title", text: $renameText)
+            Button("Cancel", role: .cancel) { renameBookID = nil }
+            Button("Save") {
+                if let id = renameBookID {
+                    store.updateBook(id) { $0.title = renameText.trimmingCharacters(in: .whitespacesAndNewlines) }
+                }
+                renameBookID = nil
+            }
+        }
+    }
+}
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private struct PlaylistPickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: LibraryStore
+    let bookID: UUID
+
+    var body: some View {
+        NavigationStack {
+            List(store.playlists) { playlist in
+                Button {
+                    store.updateBook(bookID) { book in
+                        if book.playlistIDs.contains(playlist.id) {
+                            book.playlistIDs.remove(playlist.id)
+                        } else {
+                            book.playlistIDs.insert(playlist.id)
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Text(playlist.emoji + "  " + playlist.name)
+                            .foregroundStyle(.black)
+                        Spacer()
+                        if let book = store.books.first(where: { $0.id == bookID }),
+                           book.playlistIDs.contains(playlist.id) {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(Color(red: 0.6, green: 0.2, blue: 0.5))
+                        }
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .navigationTitle("Add to Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium])
     }
 }
 
 private struct LibraryScreen: View {
     @EnvironmentObject private var store: LibraryStore
     @Binding var readerBookID: UUID?
+    @State private var tagEditorBookID: UUID?
+    @State private var newTagText = ""
+    @State private var playlistPickerBookID: UUID?
+    @State private var showPlaylistPicker = false
     @State private var query = ""
     @State private var renameBookID: UUID?
     @State private var renameText = ""
     @State private var openedMenuBookID: UUID?
     @State private var openedMenuOnRight = false
+    @State private var shareItems: [Any] = []
+    @State private var showShareSheet = false
 
     private var filteredBooks: [BookItem] {
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return store.books }
@@ -465,26 +820,37 @@ private struct LibraryScreen: View {
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 0) {
+                // Поиск
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass")
+                        .font(.system(size: 16))
                     TextField("Search", text: $query)
-                        .font(.workSans(size: 24))
+                        .font(.workSans(size: 16))
                     Image(systemName: "mic.fill")
+                        .font(.system(size: 16))
                 }
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 16)
                 .frame(height: 44)
-                .background(Color.black.opacity(0.08))
+                .background(Color.black.opacity(0.07))
                 .clipShape(Capsule())
-                .padding(.horizontal, 30)
+                .padding(.horizontal, 20)
                 .padding(.top, 16)
+                .padding(.bottom, 20)
 
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 20), GridItem(.flexible())], spacing: 24) {
+                // Грид книг
+                LazyVGrid(
+                    columns: [GridItem(.flexible(), spacing: 16), GridItem(.flexible())],
+                    spacing: 24
+                ) {
                     ForEach(Array(filteredBooks.enumerated()), id: \.element.id) { index, book in
-                        VStack(alignment: .leading, spacing: 8) {
-                            BookCard(book: book)
-                                .onTapGesture { readerBookID = book.id }
+                        VStack(alignment: .leading, spacing: 6) {
+                            GeometryReader { geo in
+                                BookCard(book: book, width: geo.size.width)
+                                    .onTapGesture { readerBookID = book.id }
+                            }
+                            .aspectRatio(0.68, contentMode: .fit)
 
                             Text(book.title)
                                 .font(.workSans(size: 13, bold: true))
@@ -507,20 +873,18 @@ private struct LibraryScreen: View {
                                 BookContextPopup(onRightSide: openedMenuOnRight) { action in
                                     switch action {
                                     case .share:
-                                        break
+                                        shareItems = [book.title, "by \(book.author)"]
+                                        showShareSheet = true
                                     case .addToPlaylist:
-                                        if let first = store.playlists.first {
-                                            store.updateBook(book.id) { $0.playlistIDs.insert(first.id) }
-                                        }
+                                        playlistPickerBookID = book.id
+                                        showPlaylistPicker = true
                                     case .toggleFinished:
                                         store.updateBook(book.id) { item in
                                             item.isFinished.toggle()
                                             if item.isFinished { item.progress = 1 }
                                         }
                                     case .addTag:
-                                        store.updateBook(book.id) { item in
-                                            if !item.tags.contains("new-tag") { item.tags.append("new-tag") }
-                                        }
+                                        tagEditorBookID = book.id
                                     case .rename:
                                         renameBookID = book.id
                                         renameText = book.title
@@ -533,7 +897,7 @@ private struct LibraryScreen: View {
                         }
                     }
                 }
-                .padding(.horizontal, 30)
+                .padding(.horizontal, 16)
                 .padding(.bottom, 120)
             }
         }
@@ -550,20 +914,62 @@ private struct LibraryScreen: View {
                 renameBookID = nil
             }
         }
-    }
-}
+        .sheet(isPresented: $showShareSheet) {
+            ShareSheet(items: shareItems)
+        }
+        .sheet(isPresented: $showPlaylistPicker) {
+            if let bookID = playlistPickerBookID {
+                PlaylistPickerSheet(bookID: bookID)
+                    .environmentObject(store)
+            }
+        }
+        .alert("Add tag", isPresented: Binding(
+                    get: { tagEditorBookID != nil },
+                    set: { if !$0 { tagEditorBookID = nil; newTagText = "" } }
+                )) {
+                    TextField("Tag name", text: $newTagText)
+                    Button("Cancel", role: .cancel) {
+                        tagEditorBookID = nil
+                        newTagText = ""
+                    }
+                    Button("Add") {
+                        if let id = tagEditorBookID {
+                            let tag = newTagText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !tag.isEmpty {
+                                store.updateBook(id) { item in
+                                    if !item.tags.contains(tag) { item.tags.append(tag) }
+                                }
+                            }
+                        }
+                        tagEditorBookID = nil
+                        newTagText = ""
+                    }
+                }
+            }
+        }
 
 private struct PlaylistScreen: View {
     @EnvironmentObject private var store: LibraryStore
+    @Binding var readerBookID: UUID?
     @State private var showingAddPlaylist = false
     @State private var newName = ""
-    @State private var newEmoji = "📚"
+    @State private var newEmoji = ""
     @State private var selectedPlaylistID: UUID?
+    @State private var openedMenuBookID: UUID?
+    @State private var openedMenuOnRight = false
+    @State private var shareItems: [Any] = []
+    @State private var showShareSheet = false
+    @State private var playlistPickerBookID: UUID?
+    @State private var showPlaylistPicker = false
+    @State private var tagEditorBookID: UUID?
+    @State private var newTagText = ""
+    @State private var renameBookID: UUID?
+    @State private var renameText = ""
 
     private func circleHeaderButton(_ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Circle()
-                .fill(Color(red: 243 / 255, green: 219 / 255, blue: 233 / 255))
+                .fill(Color(red: 243/255, green: 219/255, blue: 233/255))
                 .frame(width: 42, height: 42)
                 .overlay {
                     Image(systemName: icon)
@@ -577,73 +983,119 @@ private struct PlaylistScreen: View {
         Group {
             if let selectedID = selectedPlaylistID,
                let playlist = store.playlists.first(where: { $0.id == selectedID }) {
-                ScrollView {
-                    VStack(spacing: 18) {
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 0) {
                         HStack {
                             circleHeaderButton("chevron.left") { selectedPlaylistID = nil }
                             Spacer()
                             Text("\(playlist.emoji)  \(playlist.name)")
-                                .font(.workSans(size: 16, bold: true))
+                                .font(.workSans(size: 17, bold: true))
                             Spacer()
                             circleHeaderButton("plus") { showingAddPlaylist = true }
                         }
-                        .padding(.horizontal, 30)
+                        .padding(.horizontal, 20)
                         .padding(.top, 14)
+                        .padding(.bottom, 20)
 
                         let books = store.books.filter { $0.playlistIDs.contains(playlist.id) }
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 20), GridItem(.flexible())], spacing: 22) {
-                            ForEach(books) { book in
+                        LazyVGrid(
+                            columns: [GridItem(.flexible(), spacing: 16), GridItem(.flexible())],
+                            spacing: 24
+                        ) {
+                            ForEach(Array(books.enumerated()), id: \.element.id) { index, book in
                                 VStack(alignment: .leading, spacing: 6) {
-                                    BookCard(book: book)
-                                    Text(book.title).font(.workSans(size: 13, bold: true)).lineLimit(1)
+                                    GeometryReader { geo in
+                                        BookCard(book: book, width: geo.size.width)
+                                            .onTapGesture { readerBookID = book.id }
+                                    }
+                                    .aspectRatio(0.68, contentMode: .fit)
+
+                                    Text(book.title)
+                                        .font(.workSans(size: 13, bold: true))
+                                        .lineLimit(1)
                                     HStack {
-                                        Text("\(book.progressPercent)%").font(.workSans(size: 11)).foregroundStyle(.secondary)
+                                        Text("\(book.progressPercent)%")
+                                            .font(.workSans(size: 11))
+                                            .foregroundStyle(.secondary)
                                         Spacer()
-                                        Image(systemName: "ellipsis").foregroundStyle(.secondary)
+                                        Button {
+                                            openedMenuBookID = (openedMenuBookID == book.id) ? nil : book.id
+                                            openedMenuOnRight = index % 2 == 1
+                                        } label: {
+                                            Image(systemName: "ellipsis")
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    if openedMenuBookID == book.id {
+                                        BookContextPopup(onRightSide: openedMenuOnRight) { action in
+                                            switch action {
+                                            case .share:
+                                                shareItems = [book.title, "by \(book.author)"]
+                                                showShareSheet = true
+                                            case .addToPlaylist:
+                                                playlistPickerBookID = book.id
+                                                showPlaylistPicker = true
+                                            case .toggleFinished:
+                                                store.updateBook(book.id) { item in
+                                                    item.isFinished.toggle()
+                                                    if item.isFinished { item.progress = 1 }
+                                                }
+                                            case .addTag:
+                                                tagEditorBookID = book.id
+                                            case .rename:
+                                                renameBookID = book.id
+                                                renameText = book.title
+                                            case .delete:
+                                                store.deleteBook(book.id)
+                                            }
+                                            openedMenuBookID = nil
+                                        }
                                     }
                                 }
                             }
                         }
-                        .padding(.horizontal, 30)
-                        .padding(.bottom, 100)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 120)
                     }
                 }
             } else {
-                List {
-                ForEach(store.playlists) { playlist in
+                VStack(spacing: 0) {
+                    HStack {
+                        Spacer()
+                        Button { showingAddPlaylist = true } label: {
+                            Text("Add new  +")
+                                .font(.workSans(size: 15))
+                                .foregroundStyle(.black)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
+                    .padding(.bottom, 8)
+
+                    List(store.playlists) { playlist in
                         Button {
                             selectedPlaylistID = playlist.id
                         } label: {
                             HStack(spacing: 12) {
                                 Text(playlist.emoji)
-                                Text(playlist.name).font(.workSans(size: 16))
+                                    .font(.system(size: 20))
+                                Text(playlist.name)
+                                    .font(.workSans(size: 17))
+                                    .foregroundStyle(.black)
                                 Spacer()
-                                Image(systemName: "chevron.right").foregroundStyle(.black)
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(.black.opacity(0.4))
                             }
+                            .padding(.vertical, 8)
                         }
                         .listRowBackground(Color.clear)
-                        .listRowSeparatorTint(.gray.opacity(0.4))
-                        .padding(.vertical, 4)
+                        .listRowSeparatorTint(.gray.opacity(0.3))
                     }
-                }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                .safeAreaInset(edge: .top) {
-                    HStack {
-                        Spacer()
-                        Button { showingAddPlaylist = true } label: {
-                            Text("Add new  +")
-                                .font(.workSans(size: 16))
-                                .foregroundStyle(.black)
-                        }
-                    }
-                    .padding(.horizontal, 30)
-                    .padding(.top, 8)
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
                 }
             }
-        }
-        .onAppear {
-            if selectedPlaylistID == nil, let first = store.playlists.first { selectedPlaylistID = first.id }
         }
         .alert("New Playlist", isPresented: $showingAddPlaylist) {
             TextField("Name", text: $newName)
@@ -653,6 +1105,50 @@ private struct PlaylistScreen: View {
                 store.addPlaylist(name: newName, emoji: newEmoji)
                 newName = ""
                 newEmoji = "📚"
+            }
+        }
+        .sheet(isPresented: $showShareSheet) {
+            ShareSheet(items: shareItems)
+        }
+        .sheet(isPresented: $showPlaylistPicker) {
+            if let bookID = playlistPickerBookID {
+                PlaylistPickerSheet(bookID: bookID)
+                    .environmentObject(store)
+            }
+        }
+        .alert("Add tag", isPresented: Binding(
+            get: { tagEditorBookID != nil },
+            set: { if !$0 { tagEditorBookID = nil; newTagText = "" } }
+        )) {
+            TextField("Tag name", text: $newTagText)
+            Button("Cancel", role: .cancel) {
+                tagEditorBookID = nil
+                newTagText = ""
+            }
+            Button("Add") {
+                if let id = tagEditorBookID {
+                    let tag = newTagText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !tag.isEmpty {
+                        store.updateBook(id) { item in
+                            if !item.tags.contains(tag) { item.tags.append(tag) }
+                        }
+                    }
+                }
+                tagEditorBookID = nil
+                newTagText = ""
+            }
+        }
+        .alert("Change name", isPresented: Binding(
+            get: { renameBookID != nil },
+            set: { if !$0 { renameBookID = nil } }
+        )) {
+            TextField("Title", text: $renameText)
+            Button("Cancel", role: .cancel) { renameBookID = nil }
+            Button("Save") {
+                if let id = renameBookID {
+                    store.updateBook(id) { $0.title = renameText.trimmingCharacters(in: .whitespacesAndNewlines) }
+                }
+                renameBookID = nil
             }
         }
     }
@@ -715,57 +1211,85 @@ private struct BookContextPopup: View {
 
 private struct BookCard: View {
     let book: BookItem
+    var width: CGFloat = 146
+    
     var body: some View {
+        let height = width / 0.68
         ZStack(alignment: .bottom) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(LinearGradient(colors: [Color(red: 244 / 255, green: 209 / 255, blue: 230 / 255), Color(red: 239 / 255, green: 170 / 255, blue: 206 / 255)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                .frame(width: 146, height: 214)
+            RoundedRectangle(cornerRadius: 12)
+                .fill(LinearGradient(
+                    colors: [
+                        Color(red: 244/255, green: 209/255, blue: 230/255),
+                        Color(red: 239/255, green: 170/255, blue: 206/255)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ))
                 .shadow(color: .black.opacity(0.15), radius: 6, x: 2, y: 3)
                 .overlay(alignment: .leading) {
-                    Rectangle().fill(Color.white.opacity(0.24)).frame(width: 8)
+                    Rectangle()
+                        .fill(Color.white.opacity(0.24))
+                        .frame(width: 8)
+                        .clipShape(UnevenRoundedRectangle(
+                            topLeadingRadius: 12,
+                            bottomLeadingRadius: 12,
+                            bottomTrailingRadius: 0,
+                            topTrailingRadius: 0
+                        ))
                 }
-            VStack(spacing: 10) {
+            VStack(spacing: 8) {
                 Text(book.title)
                     .font(.workSans(size: 14))
-                    .foregroundStyle(Color(red: 147 / 255, green: 57 / 255, blue: 97 / 255))
+                    .foregroundStyle(Color(red: 147/255, green: 57/255, blue: 97/255))
                     .multilineTextAlignment(.center)
                     .lineLimit(3)
                     .padding(.horizontal, 14)
                 Text(book.author)
                     .font(.workSans(size: 10))
-                    .foregroundStyle(Color(red: 145 / 255, green: 108 / 255, blue: 133 / 255))
+                    .foregroundStyle(Color(red: 145/255, green: 108/255, blue: 133/255))
                     .lineLimit(1)
             }
-            .padding(.bottom, 12)
+            .padding(.bottom, 16)
         }
-        .frame(width: 146, height: 214)
+        .frame(width: width, height: height)
     }
 }
 
 private struct BottomTabBar: View {
     @Binding var selectedTab: BookieTab
+
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 0) {
             tabButton(icon: "🏠", title: "Home", tab: .home)
             tabButton(icon: "📚", title: "My library", tab: .library)
             tabButton(icon: "🎁", title: "Playlist", tab: .playlists)
         }
         .padding(6)
-        .background(Capsule().fill(Color(red: 245 / 255, green: 224 / 255, blue: 235 / 255).opacity(0.95)))
+        .background(
+            Capsule()
+                .fill(Color(red: 245/255, green: 224/255, blue: 235/255).opacity(0.95))
+                .shadow(color: .black.opacity(0.10), radius: 12, x: 0, y: 4)
+        )
         .overlay(Capsule().stroke(.white.opacity(0.65), lineWidth: 1))
-        .padding(.horizontal, 44)
+        .padding(.horizontal, 32)
     }
 
     private func tabButton(icon: String, title: String, tab: BookieTab) -> some View {
         Button { selectedTab = tab } label: {
-            VStack(spacing: 4) {
-                Text(icon)
-                Text(title).font(.workSans(size: 14, bold: true))
+            VStack(spacing: 3) {
+                Text(icon).font(.system(size: 22))
+                Text(title)
+                    .font(.workSans(size: 12, bold: true))
             }
             .foregroundStyle(.black)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .background(Capsule().fill(selectedTab == tab ? Color(red: 232 / 255, green: 168 / 255, blue: 205 / 255) : .clear))
+            .padding(.vertical, 10)
+            .background(
+                Capsule()
+                    .fill(selectedTab == tab
+                        ? Color(red: 232/255, green: 168/255, blue: 205/255)
+                        : .clear)
+            )
         }
     }
 }
@@ -869,6 +1393,8 @@ private struct BookReaderSheet: View {
     @State private var showTOC = false
     @State private var showBookmarks = false
     @State private var showThemes = false
+    @State private var jumpChapter = 0
+    @State private var jumpRequest = 0
 
     private var book: BookItem? { store.books.first(where: { $0.id == bookID }) }
 
@@ -877,6 +1403,8 @@ private struct BookReaderSheet: View {
             if let book {
                 ReaderContentView(
                     book: book,
+                    jumpChapter: jumpChapter,
+                    jumpRequest: jumpRequest,
                     showReaderMenu: $showReaderMenu,
                     showControls: $showControls,
                     onClose: { dismiss() }
@@ -893,42 +1421,49 @@ private struct BookReaderSheet: View {
                         onBookmarkQuick: { store.addBookmark(book.id) }
                     )
                     .padding(.bottom, 20)
-                } 
+                }
             }
         }
         .sheet(isPresented: $showTOC) {
             if let book {
-                ChapterListSheet(
-                    title: "Spis treści",
-                    chapters: book.chapters,
-                    closeTitle: "✕",
-                    onSelect: { chapter in
-                        store.updateBook(book.id) { item in
-                            item.currentChapter = chapter
-                            item.currentChunk = chapter
+                ChapterListSheet(book: book) { chapter in
+                    jumpChapter = chapter
+                    jumpRequest += 1
+                    store.updateBook(book.id) { item in
+                        item.currentChapter = chapter
+                        item.currentChunk = chapter
+                        if let pageIndex = item.chapters[safe: chapter]?.pageIndex {
+                            item.currentPage = pageIndex + 1
+                            let totalPages = max(item.pageCount ?? 1, 1)
+                            item.progress = min(max(Double(pageIndex + 1) / Double(totalPages), 0), 1)
+                        } else {
                             let total = max(item.chapters.count, 1)
                             item.progress = Double(chapter + 1) / Double(total)
                         }
-                        showTOC = false
                     }
-                )
+                    showTOC = false
+                }
             }
         }
         .sheet(isPresented: $showBookmarks) {
             if let book {
-                BookmarkListSheet(
-                    bookmarks: book.bookmarks,
-                    chapters: book.chapters,
-                    onSelect: { chapter in
-                        store.updateBook(book.id) { item in
-                            item.currentChapter = chapter
-                            item.currentChunk = chapter
+                BookmarkListSheet(book: book) { chapter in
+                    jumpChapter = chapter
+                    jumpRequest += 1
+                    store.updateBook(book.id) { item in
+                        item.currentChapter = chapter
+                        item.currentChunk = chapter
+                        if let pageIndex = item.chapters[safe: chapter]?.pageIndex {
+                            item.currentPage = pageIndex + 1
+                            let totalPages = max(item.pageCount ?? 1, 1)
+                            item.progress = min(max(Double(pageIndex + 1) / Double(totalPages), 0), 1)
+                        } else {
                             let total = max(item.chapters.count, 1)
                             item.progress = Double(chapter + 1) / Double(total)
                         }
-                        showBookmarks = false
                     }
-                )
+                    showBookmarks = false
+                }
             }
         }
         .sheet(isPresented: $showThemes) {
@@ -951,23 +1486,98 @@ private struct BookReaderSheet: View {
 private struct ReaderContentView: View {
     @EnvironmentObject private var store: LibraryStore
     let book: BookItem
+    let jumpChapter: Int
+    let jumpRequest: Int
     @Binding var showReaderMenu: Bool
     @Binding var showControls: Bool
     let onClose: () -> Void
+    @State private var contentHeight: CGFloat = 0
+    @State private var contentOffset: CGFloat = 0
+    @State private var chapterOffsets: [Int: CGFloat] = [:]
+    @State private var suppressVisibleChapterUpdates = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             if book.format == .pdf {
                 PDFReaderView(book: book)
             } else {
-                ScrollView {
-                    Text(book.chapters[safe: book.currentChapter]?.content ?? "")
-                        .font(.charter(size: CGFloat(18 * book.fontScale)))
-                        .foregroundStyle(book.readerTheme.foreground)
-                        .lineSpacing(6)
-                        .padding(.horizontal, 22)
-                        .padding(.top, 56)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                GeometryReader { geo in
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(spacing: 0) {
+                                GeometryReader { offsetGeo in
+                                    Color.clear.preference(
+                                        key: ScrollOffsetKey.self,
+                                        value: offsetGeo.frame(in: .named("scroll")).minY
+                                    )
+                                }
+                                .frame(height: 0)
+
+                                ForEach(Array(book.chapters.enumerated()), id: \.element.id) { index, chapter in
+                                    Text(chapter.content)
+                                        .font(.charter(size: CGFloat(18 * book.fontScale)))
+                                        .foregroundStyle(book.readerTheme.foreground)
+                                        .lineSpacing(6)
+                                        .padding(.horizontal, 22)
+                                        .padding(.top, index == 0 ? 56 : 32)
+                                        .padding(.bottom, 32)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .id(index)
+                                        .background(
+                                            GeometryReader { chapterGeo in
+                                                Color.clear.preference(
+                                                    key: ChapterOffsetKey.self,
+                                                    value: [index: chapterGeo.frame(in: .named("bookContent")).minY]
+                                                )
+                                            }
+                                        )
+                                }
+                            }
+                            .coordinateSpace(name: "bookContent")
+                            .background(
+                                GeometryReader { contentGeo in
+                                    Color.clear
+                                        .preference(key: ScrollContentHeightKey.self, value: contentGeo.size.height)
+                                }
+                            )
+                        }
+                        .coordinateSpace(name: "scroll")
+                        .background(book.readerTheme.background.ignoresSafeArea())
+                        .onAppear {
+                            DispatchQueue.main.async {
+                                proxy.scrollTo(book.currentChapter, anchor: .top)
+                            }
+                        }
+                        .onChange(of: jumpRequest) { _, _ in
+                            suppressVisibleChapterUpdates = true
+                            DispatchQueue.main.async {
+                                withAnimation {
+                                    proxy.scrollTo(jumpChapter, anchor: .top)
+                                }
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                suppressVisibleChapterUpdates = false
+                                publishTextProgress(viewportHeight: geo.size.height)
+                            }
+                        }
+                        .onPreferenceChange(ScrollContentHeightKey.self) { value in
+                            contentHeight = value
+                            publishTextProgress(viewportHeight: geo.size.height)
+                        }
+                        .onPreferenceChange(ScrollOffsetKey.self) { value in
+                            contentOffset = value
+                            publishTextProgress(viewportHeight: geo.size.height)
+                        }
+                        .onPreferenceChange(ChapterOffsetKey.self) { value in
+                            chapterOffsets = value
+                            publishTextProgress(viewportHeight: geo.size.height)
+                        }
+                        .onChange(of: book.fontScale) { _, _ in
+                            DispatchQueue.main.async {
+                                publishTextProgress(viewportHeight: geo.size.height)
+                            }
+                        }
+                    }
                 }
                 .background(book.readerTheme.background.ignoresSafeArea())
             }
@@ -1019,6 +1629,78 @@ private struct ReaderContentView: View {
         let total = max(book.pageCount ?? max(book.chapters.count, 1), 1)
         return "\(current) z \(total)"
     }
+
+    private func publishTextProgress(viewportHeight: CGFloat) {
+        guard book.format != .pdf, viewportHeight > 0, contentHeight > 0 else { return }
+        let pageHeight = max(viewportHeight - 88, 1)
+        let totalPages = max(Int(ceil(contentHeight / pageHeight)), 1)
+        let currentPage = min(max(Int(floor(max(-contentOffset, 0) / pageHeight)) + 1, 1), totalPages)
+        let currentChapter = suppressVisibleChapterUpdates ? book.currentChapter : visibleChapterIndex()
+        let progress = min(max(Double(currentPage) / Double(totalPages), 0), 1)
+        let chapterPageHints = calculatedChapterPageHints(pageHeight: pageHeight, totalPages: totalPages)
+
+        guard book.currentPage != currentPage ||
+              book.pageCount != totalPages ||
+              book.currentChapter != currentChapter ||
+              abs(book.progress - progress) > 0.001 ||
+              needsChapterPageHintUpdate(chapterPageHints) else { return }
+
+        store.updateBook(book.id) { item in
+            if item.currentPage != currentPage { item.currentPage = currentPage }
+            if item.pageCount != totalPages { item.pageCount = totalPages }
+            if item.currentChapter != currentChapter { item.currentChapter = currentChapter }
+            if abs(item.progress - progress) > 0.001 { item.progress = progress }
+            for (index, pageIndex) in chapterPageHints where item.chapters.indices.contains(index) {
+                if item.chapters[index].pageIndex != pageIndex {
+                    item.chapters[index].pageIndex = pageIndex
+                    item.chapters[index].locationHint = "\(pageIndex + 1)"
+                }
+            }
+            if progress >= 0.999 { item.isFinished = true }
+        }
+    }
+
+    private func visibleChapterIndex() -> Int {
+        guard !chapterOffsets.isEmpty else { return book.currentChapter }
+        let scrollY = max(-contentOffset, 0)
+        let visible = chapterOffsets
+            .filter { $0.value <= scrollY + 72 }
+            .max { $0.value < $1.value }
+        if let visible {
+            return min(max(visible.key, 0), max(book.chapters.count - 1, 0))
+        }
+        return chapterOffsets.min { abs($0.value - scrollY) < abs($1.value - scrollY) }?.key ?? book.currentChapter
+    }
+
+    private func calculatedChapterPageHints(pageHeight: CGFloat, totalPages: Int) -> [Int: Int] {
+        guard pageHeight > 0 else { return [:] }
+        var hints = estimatedChapterPageHints(totalPages: totalPages)
+        for (index, offset) in chapterOffsets {
+            hints[index] = min(max(Int(floor(max(offset, 0) / pageHeight)), 0), max(totalPages - 1, 0))
+        }
+        return hints
+    }
+
+    private func estimatedChapterPageHints(totalPages: Int) -> [Int: Int] {
+        let weights = book.chapters.map { max($0.content.count, 1) }
+        let totalWeight = max(weights.reduce(0, +), 1)
+        var cumulative = 0
+        return weights.enumerated().reduce(into: [:]) { result, pair in
+            let pageIndex = min(
+                max(Int((Double(cumulative) / Double(totalWeight)) * Double(totalPages)), 0),
+                max(totalPages - 1, 0)
+            )
+            result[pair.offset] = pageIndex
+            cumulative += pair.element
+        }
+    }
+
+    private func needsChapterPageHintUpdate(_ hints: [Int: Int]) -> Bool {
+        hints.contains { index, pageIndex in
+            guard book.chapters.indices.contains(index) else { return false }
+            return book.chapters[index].pageIndex != pageIndex || book.chapters[index].locationHint != "\(pageIndex + 1)"
+        }
+    }
 }
 
 private struct ReaderMainMenu: View {
@@ -1061,71 +1743,129 @@ private struct ReaderMainMenu: View {
 
 private struct ChapterListSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let title: String
-    let chapters: [ReaderChapter]
-    let closeTitle: String
+    let book: BookItem
     let onSelect: (Int) -> Void
 
     var body: some View {
-        NavigationStack {
-            List {
-                ForEach(Array(chapters.enumerated()), id: \.element.id) { index, chapter in
-                    Button {
-                        onSelect(index)
-                    } label: {
-                        HStack {
-                            Text(chapter.title).font(.workSans(size: 30))
-                            Spacer()
-                            Text(chapter.locationHint).font(.workSans(size: 30))
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 14) {
+                BookCard(book: book, width: 70)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(book.title)
+                        .font(.workSans(size: 16, bold: true))
+                    Text("Page \(book.currentPage ?? (book.currentChapter + 1)) of \(book.pageCount ?? book.chapters.count)")
+                        .font(.workSans(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { dismiss() } label: {
+                    Circle()
+                        .fill(Color(.systemGray5))
+                        .frame(width: 36, height: 36)
+                        .overlay {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.black)
                         }
-                        .foregroundStyle(.black)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 16)
+
+            Divider()
+
+            List {
+                ForEach(Array(book.chapters.enumerated()), id: \.element.id) { index, chapter in
+                    Button { onSelect(index) } label: {
+                        HStack {
+                            Text(chapter.title)
+                                .font(.workSans(size: 16))
+                                .foregroundStyle(.black)
+                            Spacer()
+                            Text(chapterPageLabel(index: index, chapter: chapter))
+                                .font(.workSans(size: 16))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
                     }
+                    .listRowBackground(Color.clear)
+                    .listRowSeparatorTint(.gray.opacity(0.3))
                 }
             }
-            .navigationTitle(title)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button(closeTitle) { dismiss() }
-                        .font(.workSans(size: 24, bold: true))
-                }
-            }
+            .listStyle(.plain)
         }
         .presentationDetents([.large])
+    }
+
+    private func chapterPageLabel(index: Int, chapter: ReaderChapter) -> String {
+        if let pageIndex = chapter.pageIndex {
+            return "\(pageIndex + 1)"
+        }
+        guard book.format != .pdf, let pageCount = book.pageCount, pageCount > 0 else {
+            return chapter.locationHint
+        }
+
+        let weights = book.chapters.map { max($0.content.count, 1) }
+        let totalWeight = max(weights.reduce(0, +), 1)
+        let cumulative = weights.prefix(index).reduce(0, +)
+        let pageIndex = min(
+            max(Int((Double(cumulative) / Double(totalWeight)) * Double(pageCount)), 0),
+            max(pageCount - 1, 0)
+        )
+        return "\(pageIndex + 1)"
     }
 }
 
 private struct BookmarkListSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let bookmarks: [ReaderBookmark]
-    let chapters: [ReaderChapter]
+    let book: BookItem
     let onSelect: (Int) -> Void
 
     var body: some View {
-        NavigationStack {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Bookmarks")
+                    .font(.workSans(size: 20, bold: true))
+                Spacer()
+                Button { dismiss() } label: {
+                    Circle()
+                        .fill(Color(.systemGray5))
+                        .frame(width: 36, height: 36)
+                        .overlay {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.black)
+                        }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 16)
+
+            Divider()
+
             List {
-                ForEach(bookmarks) { mark in
-                    Button {
-                        onSelect(mark.chapterIndex)
-                    } label: {
+                ForEach(book.bookmarks) { mark in
+                    Button { onSelect(mark.chapterIndex) } label: {
                         HStack {
-                            Text(chapters[safe: mark.chapterIndex]?.title ?? "Chapter")
-                                .font(.workSans(size: 30))
+                            Text(book.chapters[safe: mark.chapterIndex]?.title ?? "Chapter")
+                                .font(.workSans(size: 16))
+                                .foregroundStyle(.black)
                             Spacer()
                             Text("\(mark.chapterIndex + 1)")
-                                .font(.workSans(size: 30))
+                                .font(.workSans(size: 16))
+                                .foregroundStyle(.secondary)
                         }
-                        .foregroundStyle(.black)
+                        .padding(.vertical, 2)
                     }
+                    .listRowBackground(Color.clear)
+                    .listRowSeparatorTint(.gray.opacity(0.3))
                 }
             }
-            .navigationTitle("Zakładki i wyróżnienia")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("✓") { dismiss() }
-                        .font(.workSans(size: 24, bold: true))
-                }
-            }
+            .listStyle(.plain)
         }
+        .presentationDetents([.large])
     }
 }
 
@@ -1195,7 +1935,7 @@ private struct PDFReaderView: View {
             store.updateBook(book.id) { item in
                 item.currentPage = currentPage
                 item.pageCount = totalPages
-                item.currentChapter = max(currentPage - 1, 0)
+                item.currentChapter = item.chapterIndex(containingPage: currentPage - 1)
                 item.progress = totalPages > 0 ? Double(currentPage) / Double(totalPages) : 0
                 if item.progress >= 0.999 { item.isFinished = true }
             }
@@ -1230,7 +1970,16 @@ private struct PDFKitContainer: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: PDFView, context: Context) {}
+    func updateUIView(_ uiView: PDFView, context: Context) {
+        guard let doc = uiView.document,
+              startPage >= 0,
+              startPage < doc.pageCount,
+              let targetPage = doc.page(at: startPage) else { return }
+        if uiView.currentPage != targetPage {
+            uiView.go(to: targetPage)
+            context.coordinator.publishProgress()
+        }
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1288,23 +2037,40 @@ private enum EPUBParser {
             return nil
         }()
 
-        let tocMap = parseTOCMap(archive: archive, tocPath: tocPath)
+        let tocEntries = parseTOCEntries(archive: archive, tocPath: tocPath)
 
         var chapters: [ReaderChapter] = []
-        for (index, idRef) in spineIds.enumerated() {
-            guard let item = manifestItems.first(where: { $0.id == idRef }) else { continue }
-            let resourcePath = joinPath(base: opfDirectory, relative: item.href)
-            guard let chapterData = archive.data(for: resourcePath) else { continue }
-            let html = String(data: chapterData, encoding: .utf8) ?? String(data: chapterData, encoding: .isoLatin1) ?? ""
-            let text = html.htmlStripped.trimmingCharacters(in: .whitespacesAndNewlines)
-            if text.isEmpty { continue }
-            let chapterTitle = tocMap[item.href] ?? tocMap[(item.href as NSString).lastPathComponent] ?? "Chapter \(index + 1)"
-            chapters.append(
-                ReaderChapter(
-                    title: chapterTitle,
+        if !tocEntries.isEmpty {
+            chapters = tocEntries.enumerated().compactMap { index, entry in
+                let resourceHref = entry.href.components(separatedBy: "#").first ?? entry.href
+                let fragment = entry.href.components(separatedBy: "#").dropFirst().first
+                let resourcePath = resourceHref
+                guard let chapterData = archive.data(for: resourcePath) else { return nil }
+                let html = String(data: chapterData, encoding: .utf8) ?? String(data: chapterData, encoding: .isoLatin1) ?? ""
+                let sectionHTML = fragment.flatMap { extractHTMLSection(id: $0, from: html) } ?? html
+                let text = sectionHTML.htmlStripped.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return nil }
+
+                return ReaderChapter(
+                    title: entry.title.isEmpty ? "Chapter \(index + 1)" : entry.title,
                     content: text,
                     locationHint: "\(index + 1)"
                 )
+            }
+        }
+
+        if chapters.isEmpty {
+            var tocMap: [String: String] = [:]
+            for entry in tocEntries {
+                let key = entry.href.components(separatedBy: "#").first ?? entry.href
+                if tocMap[key] == nil { tocMap[key] = entry.title }
+            }
+            chapters = parseSpineChapters(
+                archive: archive,
+                opfDirectory: opfDirectory,
+                manifestItems: manifestItems,
+                spineIds: spineIds,
+                tocMap: tocMap
             )
         }
 
@@ -1315,11 +2081,43 @@ private enum EPUBParser {
         return EPUBParsedBook(title: metadataTitle, author: metadataAuthor, chapters: chapters)
     }
 
+    private static func parseSpineChapters(
+        archive: TinyZIPArchive,
+        opfDirectory: String,
+        manifestItems: [ManifestItem],
+        spineIds: [String],
+        tocMap: [String: String]
+    ) -> [ReaderChapter] {
+        var chapters: [ReaderChapter] = []
+        for (index, idRef) in spineIds.enumerated() {
+            guard let item = manifestItems.first(where: { $0.id == idRef }) else { continue }
+            let resourcePath = joinPath(base: opfDirectory, relative: item.href)
+            guard let chapterData = archive.data(for: resourcePath) else { continue }
+            let html = String(data: chapterData, encoding: .utf8) ?? String(data: chapterData, encoding: .isoLatin1) ?? ""
+            let text = html.htmlStripped.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { continue }
+            let chapterTitle = tocMap[item.href] ?? tocMap[resourcePath] ?? tocMap[(item.href as NSString).lastPathComponent] ?? "Chapter \(index + 1)"
+            chapters.append(
+                ReaderChapter(
+                    title: chapterTitle,
+                    content: text,
+                    locationHint: "\(index + 1)"
+                )
+            )
+        }
+        return chapters
+    }
+
     private struct ManifestItem {
         var id: String
         var href: String
         var mediaType: String
         var properties: String
+    }
+
+    private struct TOCEntry {
+        var title: String
+        var href: String
     }
 
     private static func parseManifestItems(_ xml: String) -> [ManifestItem] {
@@ -1339,21 +2137,44 @@ private enum EPUBParser {
             .compactMap { attr("idref", in: $0) }
     }
 
-    private static func parseTOCMap(archive: TinyZIPArchive, tocPath: String?) -> [String: String] {
-        guard let tocPath, let data = archive.data(for: tocPath) else { return [:] }
+    private static func parseTOCEntries(archive: TinyZIPArchive, tocPath: String?) -> [TOCEntry] {
+        guard let tocPath, let data = archive.data(for: tocPath) else { return [] }
         let xml = String(data: data, encoding: .utf8) ?? ""
+        let tocDirectory = (tocPath as NSString).deletingLastPathComponent
         let links = allMatches(in: xml, pattern: "<a\\s+[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>")
         if !links.isEmpty {
-            var map: [String: String] = [:]
-            for match in links {
-                guard let href = firstMatch(in: match, pattern: "href=\"([^\"]+)\"") else { continue }
-                let title = match.htmlStripped
-                let key = href.components(separatedBy: "#").first ?? href
-                map[key] = title
+            return links.compactMap { match in
+                guard let href = firstMatch(in: match, pattern: "href=\"([^\"]+)\"") else { return nil }
+                let title = match.htmlStripped.trimmingCharacters(in: .whitespacesAndNewlines)
+                return TOCEntry(title: title, href: joinPath(base: tocDirectory, relative: href))
             }
-            return map
         }
-        return [:]
+
+        let navPoints = allMatches(in: xml, pattern: "<navPoint\\b[\\s\\S]*?</navPoint>")
+        return navPoints.compactMap { navPoint in
+            guard let href = firstMatch(in: navPoint, pattern: "<content\\s+[^>]*src=\"([^\"]+)\"") else { return nil }
+            let title = firstMatch(in: navPoint, pattern: "<text[^>]*>(.*?)</text>")?.htmlStripped.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return TOCEntry(title: title, href: joinPath(base: tocDirectory, relative: href))
+        }
+    }
+
+    private static func extractHTMLSection(id: String, from html: String) -> String? {
+        let escapedID = NSRegularExpression.escapedPattern(for: id)
+        let startPattern = #"<[^>]+(?:id|name)\s*=\s*["']"# + escapedID + #"["'][^>]*>"#
+        guard let startRegex = try? NSRegularExpression(pattern: startPattern, options: [.caseInsensitive]),
+              let startMatch = startRegex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+              let startRange = Range(startMatch.range, in: html) else { return nil }
+
+        let searchStart = startRange.lowerBound
+        let remainder = String(html[searchStart...])
+        let nextPattern = #"<[^>]+(?:id|name)\s*=\s*["'][^"']+["'][^>]*>"#
+        guard let nextRegex = try? NSRegularExpression(pattern: nextPattern, options: [.caseInsensitive]) else {
+            return remainder
+        }
+        let matches = nextRegex.matches(in: remainder, range: NSRange(remainder.startIndex..., in: remainder))
+        guard matches.count > 1,
+              let nextRange = Range(matches[1].range, in: remainder) else { return remainder }
+        return String(remainder[..<nextRange.lowerBound])
     }
 
     private static func firstMatch(in source: String, pattern: String) -> String? {
@@ -1377,10 +2198,11 @@ private enum EPUBParser {
     }
 
     private static func joinPath(base: String, relative: String) -> String {
-        if base.isEmpty { return relative }
-        return "\(base)/\(relative)"
-            .replacingOccurrences(of: "//", with: "/")
-            .replacingOccurrences(of: "/./", with: "/")
+        let combined = base.isEmpty ? relative : (base as NSString).appendingPathComponent(relative)
+        return (combined as NSString)
+            .standardizingPath
+            .replacingOccurrences(of: "\\", with: "/")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 }
 
@@ -1544,17 +2366,90 @@ private extension Data {
 
 private extension String {
     var htmlStripped: String {
-        let data = Data(utf8)
-        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
-            .documentType: NSAttributedString.DocumentType.html,
-            .characterEncoding: String.Encoding.utf8.rawValue
+        var output = self
+        output = output.replacingOccurrences(
+            of: #"(?is)<(script|style|head|svg|math)\b[^>]*>.*?</\1>"#,
+            with: " ",
+            options: .regularExpression
+        )
+        output = output.replacingOccurrences(
+            of: #"(?i)<\s*(br|hr)\s*/?\s*>"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        output = output.replacingOccurrences(
+            of: #"(?i)</\s*(p|div|section|article|header|footer|h[1-6]|li|tr|blockquote)\s*>"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
+        output = output.replacingOccurrences(
+            of: #"(?is)<[^>]+>"#,
+            with: " ",
+            options: .regularExpression
+        )
+        output = output.decodingHTMLEntities
+        output = output.replacingOccurrences(of: "\u{00a0}", with: " ")
+        output = output.replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
+        output = output.replacingOccurrences(of: #"\n[ \t]+"#, with: "\n", options: .regularExpression)
+        output = output.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var decodingHTMLEntities: String {
+        var output = self
+        let named: [String: String] = [
+            "&amp;": "&",
+            "&lt;": "<",
+            "&gt;": ">",
+            "&quot;": "\"",
+            "&apos;": "'",
+            "&#39;": "'",
+            "&nbsp;": " ",
+            "&ndash;": "-",
+            "&mdash;": "-",
+            "&hellip;": "...",
+            "&rsquo;": "'",
+            "&lsquo;": "'",
+            "&rdquo;": "\"",
+            "&ldquo;": "\""
         ]
-        if let attributed = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-            return attributed.string
-                .replacingOccurrences(of: "\u{00a0}", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        for (entity, value) in named {
+            output = output.replacingOccurrences(of: entity, with: value)
         }
-        return self
+
+        output = output.replacingOccurrences(
+            of: #"&#(\d+);"#,
+            with: { match in
+                guard let value = Int(match), let scalar = UnicodeScalar(value) else { return " " }
+                return String(Character(scalar))
+            }
+        )
+        output = output.replacingOccurrences(
+            of: #"&#x([0-9A-Fa-f]+);"#,
+            with: { match in
+                guard let value = Int(match, radix: 16), let scalar = UnicodeScalar(value) else { return " " }
+                return String(Character(scalar))
+            }
+        )
+        return output
+    }
+
+    private func replacingOccurrences(
+        of pattern: String,
+        with transform: (String) -> String
+    ) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return self }
+        let source = self
+        let matches = regex.matches(in: source, range: NSRange(source.startIndex..., in: source))
+        var result = source
+
+        for match in matches.reversed() {
+            guard let fullRange = Range(match.range(at: 0), in: result),
+                  match.numberOfRanges > 1,
+                  let captureRange = Range(match.range(at: 1), in: result) else { continue }
+            result.replaceSubrange(fullRange, with: transform(String(result[captureRange])))
+        }
+        return result
     }
 }
 
